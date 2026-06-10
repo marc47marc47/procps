@@ -1,0 +1,41 @@
+[package]
+name = "procps-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of procps-ng 4.0.6 tools with native Windows (Win32) backend"
+license = "GPL-2.0-or-later"
+
+# 每支工具一個 bin,原始 C 版位於 procps-v4.0.6/src/
+# 平台支援狀態見 PORTING.md
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help"] }
+crossterm = "0.28"
+regex = "1"
+# top 的 TUI;ratatui 0.29 內含 crossterm 0.28,與上面版本一致
+ratatui = "0.29"
+
+# [PLATFORM:WINDOWS] 原生 Win32 API 綁定(取代 Linux /proc)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",   # GlobalMemoryStatusEx, GetSystemTimes, GetTickCount64
+    "Win32_System_ProcessStatus",       # GetPerformanceInfo, GetProcessMemoryInfo, GetMappedFileNameW
+    "Win32_System_Diagnostics_ToolHelp",# CreateToolhelp32Snapshot (行程列舉)
+    "Win32_System_Diagnostics_Debug",   # ReadProcessMemory (讀 PEB 取 cmdline/cwd)
+    "Win32_System_Threading",           # OpenProcess, GetProcessTimes, TerminateProcess, QueryFullProcessImageNameW
+    "Win32_System_Memory",              # VirtualQueryEx (pmap)
+    "Win32_System_RemoteDesktop",       # WTSEnumerateSessions (w / uptime 使用者數)
+    "Win32_Security",                   # OpenProcessToken, LookupAccountSidW (行程擁有者)
+    "Wdk_System_Threading",             # NtQueryInformationProcess (PEB 位址)
+    "Wdk_System_SystemInformation",     # NtQuerySystemInformation (真實逐核 CPU)
+    "Win32_System_WindowsProgramming",  # SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION
+] }
+
+# [PLATFORM:LINUX] / [PLATFORM:MACOS] POSIX 介面
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lib]
+name = "procps"
+path = "src/lib.rs"

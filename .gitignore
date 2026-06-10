@@ -1,0 +1,5 @@
+/target
+/dist
+# Extracted procps-ng C reference tree (reproducible from procps-v4.0.6.tar.gz,
+# and gets polluted with build artifacts). The pristine tarball is kept as the port reference.
+/procps-v4.0.6
