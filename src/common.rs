@@ -1,10 +1,10 @@
 //! Shared helpers used across the tools: version string, cross-platform notice for Linux-only flags, pidfile reading.
 
 /// Matches the original procps version source, marking this as a Rust port.
-/// Example: `free 0.1.0 (procps-rs, ported from procps-ng 4.0.6)`
+/// Example: `free 0.2.5 (procps-rust, ported from procps-ng 4.0.6)`
 pub fn version_string(tool: &str) -> String {
     format!(
-        "{tool} {} (procps-rs, ported from procps-ng {})",
+        "{tool} {} (procps-rust, ported from procps-ng {})",
         env!("CARGO_PKG_VERSION"),
         PROCPS_SOURCE_VERSION
     )

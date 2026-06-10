@@ -1,12 +1,12 @@
 [package]
-name = "procps-rs"
-version = "0.1.0"
+name = "procps"
+version = "0.2.5"
 edition = "2024"
 description = "Rust port of procps-ng 4.0.6 tools with native Windows (Win32) backend"
 license = "GPL-2.0-or-later"
 
-# 每支工具一個 bin,原始 C 版位於 procps-v4.0.6/src/
-# 平台支援狀態見 PORTING.md
+# One bin per tool; the original C sources live in procps-v4.0.6/src/.
+# See PORTING.md for per-platform support status.
 
 [dependencies]
 clap = { version = "4", features = ["derive", "wrap_help"] }

@@ -182,7 +182,7 @@ fn main() {
         if !args.no_title {
             let (cols, _) = terminal::size().unwrap_or((80, 24));
             let left = format!("Every {interval:.1}s: {title_cmd}");
-            let right = "procps-rs watch";
+            let right = "procps watch";
             let pad = (cols as usize)
                 .saturating_sub(left.len())
                 .saturating_sub(right.len());

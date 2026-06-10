@@ -1,4 +1,4 @@
-//! procps-rs — a Rust port of procps-ng 4.0.6.
+//! procps — a Rust port of procps-ng 4.0.6.
 //!
 //! Architecture mapping:
 //! - The C `library/libproc2` (which parses Linux /proc) maps to this crate's

@@ -1,4 +1,4 @@
-# procps-rs 移植說明(Porting Guide)
+# procps 移植說明(Porting Guide)
 
 本專案將 **procps-ng 4.0.6**(C 語言,原始碼在 `procps-v4.0.6/`)移植為 Rust,
 並以「跨平台抽象層 + 各平台後端」的結構,讓同一份工具程式可在
@@ -153,7 +153,7 @@ Windows 透過 `NtQuerySystemInformation(SystemProcessorPerformanceInformation, 
 - **Linux-only 概念**(pgrep `-g/-G/-s/-r/--cgroup`、vmstat `-d/-D/-p/-m`、sysctl 全部、
   slabtop、hugetop、kill `-q`、uptime `-c`…)在 Linux 走真實實作;
   Windows/macOS 接受旗標但執行時印出明確的「此平台不支援」(`common::unsupported_note`)。
-- **版本字串**統一為 `<tool> <ver> (procps-rs, 移植自 procps-ng 4.0.6)`(`common::version_string`)。
+- **版本字串**統一為 `<tool> <ver> (procps, 移植自 procps-ng 4.0.6)`(`common::version_string`)。
 
 修正過的語意衝突(對齊原版):
 - tload `-s` 原為縮放(scale),延遲是 `-d`(原本誤用 `-s` 當延遲)

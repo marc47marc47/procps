@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the procps-rs tools (Rust port of procps-ng 4.0.6).
+# Build the procps tools (Rust port of procps-ng 4.0.6).
 # Runs wherever bash + cargo exist: Linux, macOS, WSL, or Git Bash / MSYS2 on Windows.
 #
 #   bash build.sh            # optimized release build of all 18 tools

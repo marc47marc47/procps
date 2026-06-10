@@ -605,7 +605,7 @@ fn handle_key(app: &mut App, snap: &Snapshot, code: KeyCode) -> bool {
         // --- misc ---
         KeyCode::Char('=') => app.reset(),
         KeyCode::Char('?') | KeyCode::Char('h') => app.help = true,
-        KeyCode::Char('W') => app.status = "config save is a no-op in procps-rs".into(),
+        KeyCode::Char('W') => app.status = "config save is a no-op in procps-rust".into(),
         _ => {}
     }
     false
@@ -776,7 +776,7 @@ fn render_help(f: &mut Frame) {
     let popup = Rect { x, y, width: w, height: h };
 
     let lines = vec![
-        Line::from(Span::styled("procps-rs top — keys", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("procps top — keys", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from(""),
         Line::from("q/Esc quit      Enter refresh    Space pause"),
         Line::from("P/M/N/T sort by CPU/MEM/PID/TIME"),
@@ -806,7 +806,7 @@ fn render_help(f: &mut Frame) {
 fn render_header(f: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
     let arrow = if app.reverse { "v" } else { "^" };
     let mut spans = vec![
-        Span::styled("  procps-rs ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("  procps ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::styled("top ", Style::default().fg(Color::Black).bg(Color::Cyan)),
         Span::raw("  "),
         Span::styled(format!("{:.1}s", app.delay.as_secs_f64()), Style::default().fg(Color::Gray)),

@@ -1,4 +1,4 @@
-# procps-rs
+# procps
 
 [procps-ng 4.0.6](https://gitlab.com/procps-ng/procps) 的 Rust 移植版,
 以原生方式跨平台支援 **Windows / Linux / macOS**:

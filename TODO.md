@@ -1,9 +1,9 @@
-# TODO — procps-rs 參數與原版 procps-ng 4.0.6 完全對齊
+# TODO — procps 參數與原版 procps-ng 4.0.6 完全對齊
 
 追蹤 18 支工具的命令列參數對齊進度。原則:
 - 三平台 CLI 一律接受所有原版旗標(`--help` 與原版一致)。
 - Linux 走真實實作;Windows/macOS 對 Linux-only 旗標執行時印出明確「此平台不支援」。
-- 每支工具補齊 `-V/--version`,輸出 `<tool> 0.1.0 (procps-rs, 移植自 procps-ng 4.0.6)`。
+- 每支工具補齊 `-V/--version`,輸出 `<tool> 0.1.0 (procps, 移植自 procps-ng 4.0.6)`。
 
 ## 必修語意衝突缺陷(對齊即修正)
 - [x] tload:`-s` 改為 `--scale`(縮放),新增 `-d/--delay`

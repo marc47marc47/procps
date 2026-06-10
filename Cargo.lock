@@ -413,8 +413,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "procps-rs"
-version = "0.1.0"
+name = "procps"
+version = "0.2.5"
 dependencies = [
  "clap",
  "crossterm",

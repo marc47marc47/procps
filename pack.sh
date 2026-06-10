@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package the built procps-rs binaries into a tar.gz.
+# Package the built procps binaries into a tar.gz.
 # Run build.sh first. Works on Linux, macOS, WSL, or Git Bash / MSYS2 on Windows.
 #
 #   bash pack.sh             # package the release build
@@ -37,7 +37,7 @@ if [ ! -d "$OUT_DIR" ]; then
     exit 1
 fi
 
-PKG_NAME="procps-rs-${VERSION}-${OS}-${ARCH}"
+PKG_NAME="procps-${VERSION}-${OS}-${ARCH}"
 DIST_DIR="$SCRIPT_DIR/dist"
 STAGE_DIR="$DIST_DIR/$PKG_NAME"
 rm -rf "$STAGE_DIR"
