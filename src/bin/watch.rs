@@ -1,8 +1,10 @@
 //! watch — run a command periodically and display its output full-screen. Corresponds to procps-v4.0.6/src/watch.c
 //!
 //! Cross-platform terminal handling uses crossterm (works with both Windows Console and ANSI).
-//! [PLATFORM:WINDOWS] The command runs via `cmd /C <command>` (the equivalent of Unix `sh -c`);
-//! the rest of the behavior (-n/-d/-t/-x/-e/-g/-c/-b) is identical across the three platforms.
+//! [PLATFORM:WINDOWS] If a POSIX shell is available (Git Bash / MSYS / Cygwin / `$SHELL`), the
+//! command runs through it via `sh -c <command>` so pipes and quoting behave the way the user's
+//! shell expects; otherwise it falls back to `cmd /C <command>`. The rest of the behavior
+//! (-n/-d/-t/-x/-e/-g/-c/-b) is identical across the three platforms.
 
 use std::io::{Write, stdout};
 use std::process::Command;
@@ -80,20 +82,89 @@ struct Args {
     command: Vec<String>,
 }
 
-fn run_command(args: &Args) -> (String, bool) {
-    let output = if args.exec {
-        // Run directly: command[0] is the program, the rest are arguments
-        let mut c = Command::new(&args.command[0]);
-        c.args(&args.command[1..]);
-        c.output()
+/// How the watched command should be invoked, resolved once before the loop starts.
+enum Shell {
+    /// -x/--exec: run the argument list directly without a shell.
+    Exec,
+    /// Run `<prog> -c <command>` through a POSIX shell.
+    Posix(String),
+    /// [PLATFORM:WINDOWS] Run `cmd /C <command>` (fallback when no POSIX shell is found).
+    Cmd,
+}
+
+/// Locate an executable on `PATH` (appending `.exe` on Windows). A name containing a path
+/// separator is tested directly. Returns the resolved path on success.
+fn find_on_path(name: &str) -> Option<String> {
+    use std::path::Path;
+    let exts: &[&str] = if cfg!(windows) { &["", ".exe"] } else { &[""] };
+    if name.contains('/') || name.contains('\\') {
+        for ext in exts {
+            let p = format!("{name}{ext}");
+            if Path::new(&p).is_file() {
+                return Some(p);
+            }
+        }
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let cand = dir.join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Find a usable POSIX shell: honor `$SHELL` (by basename) first, then fall back to `sh`/`bash`.
+fn posix_shell() -> Option<String> {
+    let mut cands: Vec<String> = Vec::new();
+    if let Some(sh) = std::env::var_os("SHELL") {
+        let sh = sh.to_string_lossy();
+        let base = sh.rsplit(['/', '\\']).next().unwrap_or(&sh).to_string();
+        if !base.is_empty() {
+            cands.push(base);
+        }
+    }
+    cands.push("sh".into());
+    cands.push("bash".into());
+    cands.into_iter().find_map(|c| find_on_path(&c))
+}
+
+/// Decide how to run the command once, before entering the loop.
+fn resolve_shell(exec: bool) -> Shell {
+    if exec {
+        return Shell::Exec;
+    }
+    if cfg!(windows) {
+        // Prefer a POSIX shell when one is present (Git Bash / MSYS / Cygwin), so pipes and
+        // quoting match the shell the user invoked watch from; otherwise use cmd.
+        match posix_shell() {
+            Some(prog) => Shell::Posix(prog),
+            None => Shell::Cmd,
+        }
     } else {
-        // Run the whole command string through a shell
-        let joined = args.command.join(" ");
-        if cfg!(windows) {
-            // [PLATFORM:WINDOWS] use cmd /C (equivalent to Unix sh -c)
+        Shell::Posix("sh".into())
+    }
+}
+
+fn run_command(command: &[String], shell: &Shell) -> (String, bool) {
+    let output = match shell {
+        Shell::Exec => {
+            // Run directly: command[0] is the program, the rest are arguments
+            let mut c = Command::new(&command[0]);
+            c.args(&command[1..]);
+            c.output()
+        }
+        Shell::Posix(prog) => {
+            let joined = command.join(" ");
+            Command::new(prog).arg("-c").arg(&joined).output()
+        }
+        Shell::Cmd => {
+            let joined = command.join(" ");
             Command::new("cmd").arg("/C").arg(&joined).output()
-        } else {
-            Command::new("sh").arg("-c").arg(&joined).output()
         }
     };
 
@@ -168,10 +239,11 @@ fn main() {
     let mut prev: Option<String> = None;
     let mut unchanged_streak = 0u64;
     let title_cmd = args.command.join(" ");
+    let shell = resolve_shell(args.exec);
 
     loop {
         let start = Instant::now();
-        let (content, ok) = run_command(&args);
+        let (content, ok) = run_command(&args.command, &shell);
 
         // -f/--follow: do not clear the screen, just keep printing
         if !args.follow {
