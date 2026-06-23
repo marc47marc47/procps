@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag/version label for the archives (e.g. v0.2.6)'
+        required: false
+        default: 'dev'
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.ver.outputs.version }}"
+          name="procps-${version}-${{ matrix.target }}"
+          out="target/${{ matrix.target }}/release"
+          bins="free hugetop kill pgrep pidof pidwait pkill pmap ps pwdx slabtop sysctl tload top uptime vmstat w watch"
+          mkdir -p "$name"
+          for b in $bins; do cp "$out/$b" "$name/"; done
+          cp README.md PORTING.md "$name/" 2>/dev/null || true
+          mkdir -p dist
+          tar -czf "dist/${name}.tar.gz" "$name"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          $name = "procps-$version-${{ matrix.target }}"
+          $out = "target/${{ matrix.target }}/release"
+          $bins = @('free','hugetop','kill','pgrep','pidof','pidwait','pkill','pmap','ps','pwdx','slabtop','sysctl','tload','top','uptime','vmstat','w','watch')
+          New-Item -ItemType Directory -Force -Path $name | Out-Null
+          foreach ($b in $bins) { Copy-Item "$out/$b.exe" $name }
+          Copy-Item README.md,PORTING.md $name -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path $name -DestinationPath "dist/$name.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: procps-${{ matrix.target }}
+          path: dist/*
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
