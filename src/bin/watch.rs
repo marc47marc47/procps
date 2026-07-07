@@ -5,6 +5,10 @@
 //! command runs through it via `sh -c <command>` so pipes and quoting behave the way the user's
 //! shell expects; otherwise it falls back to `cmd /C <command>`. The rest of the behavior
 //! (-n/-d/-t/-x/-e/-g/-c/-b) is identical across the three platforms.
+//!
+//! Press q twice to exit: the first press shows a confirmation prompt on the bottom line, the
+//! second press quits, and any other key cancels. Ctrl+C still exits immediately. The terminal
+//! runs in raw mode between refreshes so keys are picked up without Enter.
 
 use std::io::{Write, stdout};
 use std::process::Command;
@@ -13,6 +17,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use crossterm::{
     cursor,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
     QueueableCommand,
@@ -180,6 +185,107 @@ fn run_command(command: &[String], shell: &Shell) -> (String, bool) {
     }
 }
 
+/// Enables raw mode for the lifetime of the value so key presses (q to quit) are readable
+/// without Enter; restores the terminal on drop. Raw mode also stops the console from
+/// echoing typed characters into the display.
+struct RawGuard {
+    active: bool,
+}
+
+impl RawGuard {
+    fn new() -> Self {
+        RawGuard {
+            active: terminal::enable_raw_mode().is_ok(),
+        }
+    }
+    fn release(&mut self) {
+        if self.active {
+            let _ = terminal::disable_raw_mode();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+const QUIT_PROMPT: &str = "press q again will exit";
+
+/// Show the quit-confirmation prompt on the bottom line of the terminal.
+fn draw_quit_prompt(out: &mut impl Write) {
+    let (_, rows) = terminal::size().unwrap_or((80, 24));
+    out.queue(cursor::SavePosition).ok();
+    out.queue(cursor::MoveTo(0, rows.saturating_sub(1))).ok();
+    out.queue(Clear(ClearType::CurrentLine)).ok();
+    out.queue(SetForegroundColor(Color::Red)).ok();
+    out.queue(Print(QUIT_PROMPT)).ok();
+    out.queue(ResetColor).ok();
+    out.queue(cursor::RestorePosition).ok();
+    out.flush().ok();
+}
+
+/// Erase the quit-confirmation prompt from the bottom line.
+fn clear_quit_prompt(out: &mut impl Write) {
+    let (_, rows) = terminal::size().unwrap_or((80, 24));
+    out.queue(cursor::SavePosition).ok();
+    out.queue(cursor::MoveTo(0, rows.saturating_sub(1))).ok();
+    out.queue(Clear(ClearType::CurrentLine)).ok();
+    out.queue(cursor::RestorePosition).ok();
+    out.flush().ok();
+}
+
+/// Sleep until the next cycle while watching the keyboard. Quitting takes two presses of q:
+/// the first sets `pending` and shows the confirmation prompt, the second returns true; any
+/// other key cancels. Ctrl+C exits immediately (raw mode intercepts it as a key event, so it
+/// must be handled here). `pending` survives across refresh cycles so the confirmation isn't
+/// lost when the screen redraws mid-wait.
+fn wait_or_quit(dur: Duration, pending: &mut bool, out: &mut impl Write) -> bool {
+    let deadline = Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match event::poll(remaining) {
+            Ok(true) => {
+                if let Ok(Event::Key(k)) = event::read() {
+                    // [PLATFORM:WINDOWS] key-release events also arrive; only act on presses
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match k.code {
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return true;
+                        }
+                        KeyCode::Char('q') | KeyCode::Char('Q') => {
+                            if *pending {
+                                return true;
+                            }
+                            *pending = true;
+                            draw_quit_prompt(out);
+                        }
+                        _ => {
+                            if *pending {
+                                *pending = false;
+                                clear_quit_prompt(out);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(false) => return false,
+            // stdin is not a terminal (e.g. redirected): fall back to a plain sleep
+            Err(_) => {
+                std::thread::sleep(remaining);
+                return false;
+            }
+        }
+    }
+}
+
 /// Simple per-character difference highlighting (watch -d): characters that differ from the previous output are shown in red.
 fn render(
     out: &mut impl Write,
@@ -240,6 +346,10 @@ fn main() {
     let mut unchanged_streak = 0u64;
     let title_cmd = args.command.join(" ");
     let shell = resolve_shell(args.exec);
+    // Raw mode lets us react to a bare `q` key press; restored on exit via Drop
+    let mut raw = RawGuard::new();
+    // True after the first q press, awaiting confirmation with a second q
+    let mut quit_pending = false;
 
     loop {
         let start = Instant::now();
@@ -264,6 +374,10 @@ fn main() {
 
         render(&mut out, &content, prev.as_deref(), args.differences, use_color).ok();
         out.flush().ok();
+        // The redraw wiped the confirmation prompt; restore it while a quit is pending
+        if quit_pending {
+            draw_quit_prompt(&mut out);
+        }
 
         let changed = prev.as_deref() != Some(content.as_str());
         if args.beep && changed && prev.is_some() {
@@ -286,6 +400,7 @@ fn main() {
         }
         if args.errexit && !ok {
             // Wait for a key press before leaving (simplified to match watch's behavior: exit directly)
+            raw.release();
             eprintln!("\nwatch: command returned non-zero, exiting");
             std::process::exit(1);
         }
@@ -297,6 +412,10 @@ fn main() {
         } else {
             Duration::from_secs_f64(interval)
         };
-        std::thread::sleep(wait);
+        // q pressed twice exits watch (Ctrl+C exits immediately)
+        if wait_or_quit(wait, &mut quit_pending, &mut out) {
+            break;
+        }
     }
+    raw.release();
 }
