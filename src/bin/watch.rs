@@ -9,18 +9,27 @@
 //! Press q twice to exit: the first press shows a confirmation prompt on the bottom line, the
 //! second press quits, and any other key cancels. Ctrl+C still exits immediately. The terminal
 //! runs in raw mode between refreshes so keys are picked up without Enter.
+//!
+//! Unless -f/--follow is given the display lives in the alternate screen and is repainted in
+//! place (move-to + erase-to-end-of-line per row) rather than cleared wholesale. Nothing is ever
+//! written past the last row and no newline follows the last line, so the viewport never scrolls
+//! and old frames cannot stack up.
+//!
+//! stdout and stderr are kept apart. Upstream watch(1) merges them, which lets a command that
+//! chatters on stderr (`du` on unreadable directories, for one) push the real output around from
+//! cycle to cycle. Here stderr gets its own pane pinned to the bottom of the screen, sized to the
+//! error text and capped at a third of the window; stdout keeps the rest.
 
-use std::io::{Write, stdout};
+use std::io::{BufWriter, Write, stdout};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use crossterm::{
-    cursor,
+    QueueableCommand, cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{self, Clear, ClearType},
-    QueueableCommand,
+    terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
 #[derive(Parser)]
@@ -155,7 +164,9 @@ fn resolve_shell(exec: bool) -> Shell {
     }
 }
 
-fn run_command(command: &[String], shell: &Shell) -> (String, bool) {
+/// Run the command once. stdout and stderr are returned separately so the renderer can keep them
+/// in separate panes; the bool is the exit status for -e/--errexit.
+fn run_command(command: &[String], shell: &Shell) -> (String, String, bool) {
     let output = match shell {
         Shell::Exec => {
             // Run directly: command[0] is the program, the rest are arguments
@@ -174,14 +185,16 @@ fn run_command(command: &[String], shell: &Shell) -> (String, bool) {
     };
 
     match output {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            if !o.stderr.is_empty() {
-                s.push_str(&String::from_utf8_lossy(&o.stderr));
-            }
-            (s, o.status.success())
-        }
-        Err(e) => (format!("watch: failed to run command: {e}"), false),
+        Ok(o) => (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+            o.status.success(),
+        ),
+        Err(e) => (
+            String::new(),
+            format!("watch: failed to run command: {e}"),
+            false,
+        ),
     }
 }
 
@@ -212,57 +225,111 @@ impl Drop for RawGuard {
     }
 }
 
+/// Switches to the alternate screen buffer and hides the cursor, restoring both on release.
+/// Painting into the alternate buffer keeps the user's scrollback intact, and combined with the
+/// bounded repaint in `draw_frame` it means a frame can never scroll the viewport.
+///
+/// `release` is idempotent and must be called explicitly on any path that reaches
+/// `std::process::exit`, which does not run destructors.
+struct ScreenGuard {
+    active: bool,
+}
+
+impl ScreenGuard {
+    fn enter() -> Self {
+        let mut out = stdout();
+        let ok = out.queue(EnterAlternateScreen).is_ok()
+            && out.queue(cursor::Hide).is_ok()
+            && out.flush().is_ok();
+        ScreenGuard { active: ok }
+    }
+    /// -f/--follow keeps the normal screen: a guard that owns nothing.
+    fn disabled() -> Self {
+        ScreenGuard { active: false }
+    }
+    fn release(&mut self) {
+        if self.active {
+            let mut out = stdout();
+            let _ = out.queue(cursor::Show);
+            let _ = out.queue(LeaveAlternateScreen);
+            let _ = out.flush();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ScreenGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 const QUIT_PROMPT: &str = "press q again will exit";
 
-/// Show the quit-confirmation prompt on the bottom line of the terminal.
+/// Show the quit-confirmation prompt on the bottom line of the terminal. It overwrites whatever
+/// occupies that row; the next repaint restores it.
 fn draw_quit_prompt(out: &mut impl Write) {
     let (_, rows) = terminal::size().unwrap_or((80, 24));
-    out.queue(cursor::SavePosition).ok();
     out.queue(cursor::MoveTo(0, rows.saturating_sub(1))).ok();
     out.queue(Clear(ClearType::CurrentLine)).ok();
     out.queue(SetForegroundColor(Color::Red)).ok();
     out.queue(Print(QUIT_PROMPT)).ok();
     out.queue(ResetColor).ok();
-    out.queue(cursor::RestorePosition).ok();
     out.flush().ok();
 }
 
 /// Erase the quit-confirmation prompt from the bottom line.
 fn clear_quit_prompt(out: &mut impl Write) {
     let (_, rows) = terminal::size().unwrap_or((80, 24));
-    out.queue(cursor::SavePosition).ok();
     out.queue(cursor::MoveTo(0, rows.saturating_sub(1))).ok();
     out.queue(Clear(ClearType::CurrentLine)).ok();
-    out.queue(cursor::RestorePosition).ok();
     out.flush().ok();
 }
 
+/// Why the wait between cycles ended.
+enum Wake {
+    /// The interval elapsed: run the command again.
+    Timeout,
+    /// The window changed size: repaint now rather than leaving a half-drawn frame up.
+    Resize,
+    /// The user asked to leave.
+    Quit,
+}
+
 /// Sleep until the next cycle while watching the keyboard. Quitting takes two presses of q:
-/// the first sets `pending` and shows the confirmation prompt, the second returns true; any
+/// the first sets `pending` and shows the confirmation prompt, the second returns `Quit`; any
 /// other key cancels. Ctrl+C exits immediately (raw mode intercepts it as a key event, so it
 /// must be handled here). `pending` survives across refresh cycles so the confirmation isn't
 /// lost when the screen redraws mid-wait.
-fn wait_or_quit(dur: Duration, pending: &mut bool, out: &mut impl Write) -> bool {
+///
+/// A resize cuts the wait short unless `rerun_on_resize` is false (-r/--no-rerun), in which case
+/// the event is swallowed and the current frame stays up until the interval elapses.
+fn wait_or_quit(
+    dur: Duration,
+    pending: &mut bool,
+    out: &mut impl Write,
+    rerun_on_resize: bool,
+) -> Wake {
     let deadline = Instant::now() + dur;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return Wake::Timeout;
         }
         match event::poll(remaining) {
-            Ok(true) => {
-                if let Ok(Event::Key(k)) = event::read() {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(k)) => {
                     // [PLATFORM:WINDOWS] key-release events also arrive; only act on presses
                     if k.kind != KeyEventKind::Press {
                         continue;
                     }
                     match k.code {
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return true;
+                            return Wake::Quit;
                         }
                         KeyCode::Char('q') | KeyCode::Char('Q') => {
                             if *pending {
-                                return true;
+                                return Wake::Quit;
                             }
                             *pending = true;
                             draw_quit_prompt(out);
@@ -275,54 +342,206 @@ fn wait_or_quit(dur: Duration, pending: &mut bool, out: &mut impl Write) -> bool
                         }
                     }
                 }
-            }
-            Ok(false) => return false,
+                Ok(Event::Resize(_, _)) if rerun_on_resize => return Wake::Resize,
+                Ok(_) => continue,
+                Err(_) => return Wake::Timeout,
+            },
+            Ok(false) => return Wake::Timeout,
             // stdin is not a terminal (e.g. redirected): fall back to a plain sleep
             Err(_) => {
                 std::thread::sleep(remaining);
-                return false;
+                return Wake::Timeout;
             }
         }
     }
 }
 
-/// Simple per-character difference highlighting (watch -d): characters that differ from the previous output are shown in red.
-fn render(
+/// Write `text` at the start of `row`, clipped to `cols` columns, erasing the rest of the line.
+/// Nothing is written past the last column, so the cursor never wraps onto the next row.
+fn draw_row(out: &mut impl Write, row: u16, cols: u16, text: &str) -> std::io::Result<()> {
+    out.queue(cursor::MoveTo(0, row))?;
+    out.queue(Clear(ClearType::UntilNewLine))?;
+    let clipped: String = text.chars().take(cols as usize).collect();
+    out.queue(Print(clipped))?;
+    Ok(())
+}
+
+/// Erase rows `from..to` (exclusive) left over by a taller previous frame.
+fn clear_rows(out: &mut impl Write, from: u16, to: u16) -> std::io::Result<()> {
+    for row in from..to {
+        out.queue(cursor::MoveTo(0, row))?;
+        out.queue(Clear(ClearType::UntilNewLine))?;
+    }
+    Ok(())
+}
+
+/// The `Every 2.0s: <cmd>` header, right-aligning the brand when it fits. `draw_row` clips it to
+/// the window, so a long command truncates instead of wrapping onto a second row and pushing the
+/// body down.
+fn title_line(interval: f64, cmd: &str, cols: u16) -> String {
+    let left = format!("Every {interval:.1}s: {cmd}");
+    let right = "procps watch";
+    let width = cols as usize;
+    let used = left.chars().count() + right.len();
+    if used < width {
+        format!("{left}{}{right}", " ".repeat(width - used))
+    } else {
+        left
+    }
+}
+
+/// Paint the stdout body into rows `top..limit`, per-character difference highlighting (watch -d)
+/// showing characters that differ from the previous output in red. Lines beyond the region and
+/// columns beyond the window are dropped; unused rows in the region are erased.
+fn draw_body(
     out: &mut impl Write,
     content: &str,
     prev: Option<&str>,
     differences: bool,
-    use_color: bool,
+    cols: u16,
+    top: u16,
+    limit: u16,
 ) -> std::io::Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
     let prev_lines: Vec<&str> = prev.map(|p| p.lines().collect()).unwrap_or_default();
-
+    let mut row = top;
     for (li, line) in content.lines().enumerate() {
-        if li as u16 >= rows.saturating_sub(2) {
+        if row >= limit {
             break;
         }
-        let prev_line = prev_lines.get(li).copied().unwrap_or("");
-        let mut col = 0u16;
-        for (ci, ch) in line.chars().enumerate() {
-            if col >= cols {
+        out.queue(cursor::MoveTo(0, row))?;
+        out.queue(Clear(ClearType::UntilNewLine))?;
+        let mut prev_chars = prev_lines.get(li).copied().unwrap_or("").chars();
+        for (col, ch) in line.chars().enumerate() {
+            if col as u16 >= cols {
                 break;
             }
-            let changed = differences && prev_line.chars().nth(ci) != Some(ch);
-            if changed {
+            // `prev_chars` walks in lockstep with `line`; short-circuiting when -d is off just
+            // means we never consume it.
+            if differences && prev_chars.next() != Some(ch) {
                 out.queue(SetForegroundColor(Color::Red))?;
                 out.queue(Print(ch))?;
                 out.queue(ResetColor)?;
-            } else if use_color {
-                // Output directly (keep the original ANSI; not filtered here, the terminal interprets it)
-                out.queue(Print(ch))?;
             } else {
                 out.queue(Print(ch))?;
             }
-            col += 1;
+        }
+        row += 1;
+    }
+    clear_rows(out, row, limit)
+}
+
+/// Height of the stderr pane (separator + error lines) for `err_lines` lines of stderr, or `None`
+/// when stderr is empty or the window is too short to spare the rows. Capped at a third of the
+/// window so a flood of errors can never crowd out the command's real output.
+fn stderr_pane_height(err_lines: usize, rows: u16) -> Option<u16> {
+    if err_lines == 0 {
+        return None;
+    }
+    let cap = (rows / 3).max(1);
+    let height = (err_lines as u16).min(cap) + 1; // + separator
+    // Leave at least one row for the body.
+    (height < rows).then_some(height)
+}
+
+/// Paint the stderr pane across the bottom `height` rows: a red rule naming the line count, then
+/// the tail of stderr (the newest lines, which is what a command still emitting errors is saying
+/// now).
+fn draw_stderr(
+    out: &mut impl Write,
+    err_lines: &[&str],
+    cols: u16,
+    rows: u16,
+    height: u16,
+) -> std::io::Result<()> {
+    let top = rows - height;
+    let shown = (height - 1) as usize;
+    let hidden = err_lines.len().saturating_sub(shown);
+
+    let label = if hidden > 0 {
+        format!("stderr ({} lines, {hidden} not shown) ", err_lines.len())
+    } else {
+        format!("stderr ({} lines) ", err_lines.len())
+    };
+    let rule = format!("── {label}");
+    let fill = (cols as usize).saturating_sub(rule.chars().count());
+
+    out.queue(SetForegroundColor(Color::Red))?;
+    draw_row(out, top, cols, &format!("{rule}{}", "─".repeat(fill)))?;
+    for (i, line) in err_lines[hidden..].iter().enumerate() {
+        draw_row(out, top + 1 + i as u16, cols, line)?;
+    }
+    out.queue(ResetColor)?;
+    Ok(())
+}
+
+/// Repaint the whole window: title, then stdout in the rows above the stderr pane, then the pane
+/// itself. Every row is addressed absolutely and nothing is written below the last one, so the
+/// frame always lands inside the viewport no matter how much the command printed.
+fn draw_frame(
+    out: &mut impl Write,
+    args: &Args,
+    interval: f64,
+    title_cmd: &str,
+    content: &str,
+    stderr: &str,
+    prev: Option<&str>,
+) -> std::io::Result<()> {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
+
+    let err_lines: Vec<&str> = stderr.lines().collect();
+    let pane = stderr_pane_height(err_lines.len(), rows);
+    let body_limit = rows - pane.unwrap_or(0);
+
+    let mut top = 0u16;
+    if !args.no_title {
+        draw_row(out, 0, cols, &title_line(interval, title_cmd, cols))?;
+        draw_row(out, 1, cols, "")?;
+        top = 2;
+    }
+    if top < body_limit {
+        draw_body(out, content, prev, args.differences, cols, top, body_limit)?;
+    }
+    if let Some(height) = pane {
+        draw_stderr(out, &err_lines, cols, rows, height)?;
+    }
+    out.flush()
+}
+
+/// -f/--follow: keep the normal screen and stream each cycle's output, tagging stderr so it stays
+/// distinguishable without a pane to put it in. -d still highlights, as it did before stderr got
+/// its own pane.
+fn draw_follow(
+    out: &mut impl Write,
+    content: &str,
+    stderr: &str,
+    prev: Option<&str>,
+    differences: bool,
+) -> std::io::Result<()> {
+    let prev_lines: Vec<&str> = prev.map(|p| p.lines().collect()).unwrap_or_default();
+    for (li, line) in content.lines().enumerate() {
+        let mut prev_chars = prev_lines.get(li).copied().unwrap_or("").chars();
+        for ch in line.chars() {
+            if differences && prev_chars.next() != Some(ch) {
+                out.queue(SetForegroundColor(Color::Red))?;
+                out.queue(Print(ch))?;
+                out.queue(ResetColor)?;
+            } else {
+                out.queue(Print(ch))?;
+            }
         }
         out.queue(Print("\r\n"))?;
     }
-    Ok(())
+    if !stderr.is_empty() {
+        out.queue(SetForegroundColor(Color::Red))?;
+        for line in stderr.lines() {
+            out.queue(Print(format!("stderr: {line}\r\n")))?;
+        }
+        out.queue(ResetColor)?;
+    }
+    out.flush()
 }
 
 fn main() {
@@ -336,11 +555,13 @@ fn main() {
         std::process::exit(1);
     }
     let interval = args.interval.max(0.1);
-    // The following flags are included for CLI parity; their behavior is a no-op or covered by render's existing truncation
-    let _ = (&args.no_rerun, &args.shotsdir, &args.no_wrap);
-    // -C/--no-color takes precedence over -c/--color
-    let use_color = args.color && !args.no_color;
-    let mut out = stdout();
+    // Accepted for CLI parity: -s/--shotsdir is a no-op, and -w/--no-wrap is implicit because
+    // draw_row clips every line to the window width. -c/-C likewise: ANSI sequences in the
+    // command's output reach the terminal either way.
+    let _ = (&args.shotsdir, &args.no_wrap, &args.color, &args.no_color);
+    // Buffer the frame: `Stdout` is line-buffered, which would flush a syscall per row and make
+    // the repaint visibly tear.
+    let mut out = BufWriter::new(stdout());
 
     let mut prev: Option<String> = None;
     let mut unchanged_streak = 0u64;
@@ -348,40 +569,48 @@ fn main() {
     let shell = resolve_shell(args.exec);
     // Raw mode lets us react to a bare `q` key press; restored on exit via Drop
     let mut raw = RawGuard::new();
+    // -f/--follow streams into the normal screen; otherwise repaint in the alternate buffer
+    let mut screen = if args.follow {
+        ScreenGuard::disabled()
+    } else {
+        ScreenGuard::enter()
+    };
     // True after the first q press, awaiting confirmation with a second q
     let mut quit_pending = false;
 
     loop {
         let start = Instant::now();
-        let (content, ok) = run_command(&args.command, &shell);
+        let (content, stderr, ok) = run_command(&args.command, &shell);
 
-        // -f/--follow: do not clear the screen, just keep printing
-        if !args.follow {
-            out.queue(Clear(ClearType::All)).ok();
-            out.queue(cursor::MoveTo(0, 0)).ok();
+        if args.follow {
+            draw_follow(
+                &mut out,
+                &content,
+                &stderr,
+                prev.as_deref(),
+                args.differences,
+            )
+            .ok();
+        } else {
+            draw_frame(
+                &mut out,
+                &args,
+                interval,
+                &title_cmd,
+                &content,
+                &stderr,
+                prev.as_deref(),
+            )
+            .ok();
         }
-
-        if !args.no_title {
-            let (cols, _) = terminal::size().unwrap_or((80, 24));
-            let left = format!("Every {interval:.1}s: {title_cmd}");
-            let right = "procps watch";
-            let pad = (cols as usize)
-                .saturating_sub(left.len())
-                .saturating_sub(right.len());
-            out.queue(Print(format!("{left}{}{right}\r\n\r\n", " ".repeat(pad))))
-                .ok();
-        }
-
-        render(&mut out, &content, prev.as_deref(), args.differences, use_color).ok();
-        out.flush().ok();
-        // The redraw wiped the confirmation prompt; restore it while a quit is pending
+        // The repaint wiped the confirmation prompt; restore it while a quit is pending
         if quit_pending {
             draw_quit_prompt(&mut out);
         }
 
         let changed = prev.as_deref() != Some(content.as_str());
         if args.beep && changed && prev.is_some() {
-            print!("\x07");
+            out.queue(Print("\x07")).ok();
             out.flush().ok();
         }
         if args.chgexit && changed && prev.is_some() {
@@ -399,9 +628,15 @@ fn main() {
             }
         }
         if args.errexit && !ok {
-            // Wait for a key press before leaving (simplified to match watch's behavior: exit directly)
+            // std::process::exit skips Drop, so restore the terminal by hand before leaving, then
+            // echo stderr — the pane it was in is about to disappear with the alternate screen.
+            out.flush().ok();
             raw.release();
-            eprintln!("\nwatch: command returned non-zero, exiting");
+            screen.release();
+            if !stderr.is_empty() {
+                eprint!("{stderr}");
+            }
+            eprintln!("watch: command returned non-zero, exiting");
             std::process::exit(1);
         }
         prev = Some(content);
@@ -413,9 +648,12 @@ fn main() {
             Duration::from_secs_f64(interval)
         };
         // q pressed twice exits watch (Ctrl+C exits immediately)
-        if wait_or_quit(wait, &mut quit_pending, &mut out) {
-            break;
+        match wait_or_quit(wait, &mut quit_pending, &mut out, !args.no_rerun) {
+            Wake::Quit => break,
+            Wake::Timeout | Wake::Resize => {}
         }
     }
+    out.flush().ok();
     raw.release();
+    screen.release();
 }

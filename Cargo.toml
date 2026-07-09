@@ -1,6 +1,6 @@
 [package]
 name = "procps"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 description = "Rust port of procps-ng 4.0.6 tools with native Windows (Win32) backend"
 license = "GPL-2.0-or-later"
