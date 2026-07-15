@@ -6,6 +6,12 @@
 //! shell expects; otherwise it falls back to `cmd /C <command>`. The rest of the behavior
 //! (-n/-d/-t/-x/-e/-g/-c/-b) is identical across the three platforms.
 //!
+//! The body preserves the command's own ANSI colours by default (as watch -c does): escape
+//! sequences pass through with zero display width so they never eat into the column budget, and
+//! each row ends with a reset so an unterminated colour can't bleed. -C/--no-color prints the raw
+//! characters instead, and -d/--differences takes precedence, replacing the command's colours with
+//! its own red per-character diff highlighting.
+//!
 //! Press q twice to exit: the first press shows a confirmation prompt on the bottom line, the
 //! second press quits, and any other key cancels. Ctrl+C still exits immediately. The terminal
 //! runs in raw mode between refreshes so keys are picked up without Enter.
@@ -356,6 +362,94 @@ fn wait_or_quit(
     }
 }
 
+/// A piece of a line: a zero-width control sequence to emit verbatim, or one visible column.
+enum Seg {
+    /// An ANSI escape sequence (e.g. an SGR colour code). Emitted as-is, counts as no columns.
+    Escape(String),
+    /// A single printable character, one column wide.
+    Char(char),
+}
+
+/// Split a line into zero-width escape sequences and visible characters. Recognises CSI
+/// (`ESC [ … final`) and OSC (`ESC ] … BEL/ST`) sequences plus a lone two-byte `ESC x`; anything
+/// else is a visible character. Used by the -c/--color path so colour codes reach the terminal
+/// without stealing columns from `draw_line_ansi`'s width budget.
+fn parse_segments(line: &str) -> Vec<Seg> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(Seg::Char(c));
+            continue;
+        }
+        let mut seq = String::from('\x1b');
+        match chars.peek() {
+            Some('[') => {
+                seq.push(chars.next().unwrap()); // consume '['
+                // params/intermediates run until a final byte in 0x40..=0x7e (e.g. 'm')
+                while let Some(&n) = chars.peek() {
+                    seq.push(n);
+                    chars.next();
+                    if ('\x40'..='\x7e').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                seq.push(chars.next().unwrap()); // consume ']'
+                // OSC runs until BEL (0x07) or ST (ESC \)
+                while let Some(&n) = chars.peek() {
+                    if n == '\x07' {
+                        seq.push(n);
+                        chars.next();
+                        break;
+                    }
+                    if n == '\x1b' {
+                        seq.push(n);
+                        chars.next();
+                        if let Some(&'\\') = chars.peek() {
+                            seq.push(chars.next().unwrap());
+                        }
+                        break;
+                    }
+                    seq.push(n);
+                    chars.next();
+                }
+            }
+            // Two-byte escapes such as `ESC c` (reset) or `ESC M`.
+            Some(_) => seq.push(chars.next().unwrap()),
+            None => {}
+        }
+        out.push(Seg::Escape(seq));
+    }
+    out
+}
+
+/// Render one line preserving its ANSI colours (the default, and -c/--color): escape sequences
+/// pass through with zero display width, only visible characters count toward `cols`, and the line
+/// ends with a reset so an unterminated colour can't bleed into the erased tail or the next row.
+/// Colour and -d are mutually exclusive — -d takes the plainer `draw_body` path — so this never
+/// needs to do difference highlighting.
+fn draw_line_ansi(out: &mut impl Write, line: &str, cols: usize) -> std::io::Result<()> {
+    let mut col = 0usize;
+    for seg in parse_segments(line) {
+        match seg {
+            Seg::Escape(s) => {
+                out.queue(Print(s))?;
+            }
+            Seg::Char(ch) => {
+                if col >= cols {
+                    break;
+                }
+                out.queue(Print(ch))?;
+                col += 1;
+            }
+        }
+    }
+    out.queue(ResetColor)?;
+    Ok(())
+}
+
 /// Write `text` at the start of `row`, clipped to `cols` columns, erasing the rest of the line.
 /// Nothing is written past the last column, so the cursor never wraps onto the next row.
 fn draw_row(out: &mut impl Write, row: u16, cols: u16, text: &str) -> std::io::Result<()> {
@@ -390,14 +484,40 @@ fn title_line(interval: f64, cmd: &str, cols: u16) -> String {
     }
 }
 
-/// Paint the stdout body into rows `top..limit`, per-character difference highlighting (watch -d)
-/// showing characters that differ from the previous output in red. Lines beyond the region and
-/// columns beyond the window are dropped; unused rows in the region are erased.
+/// How the stdout body is rendered. The three modes are mutually exclusive: -d wins over colour,
+/// -C disables colour, and the default keeps the command's colours.
+#[derive(Clone, Copy)]
+enum BodyStyle {
+    /// Preserve the command's ANSI colours (the default, and -c/--color).
+    Color,
+    /// Highlight per-character differences from the previous frame in red (-d/--differences).
+    Diff,
+    /// Print raw characters with no interpretation (-C/--no-color without -d).
+    Plain,
+}
+
+impl BodyStyle {
+    /// -d takes precedence, then -C, then the default of keeping the command's colours.
+    fn from_args(args: &Args) -> Self {
+        if args.differences {
+            BodyStyle::Diff
+        } else if args.no_color {
+            BodyStyle::Plain
+        } else {
+            BodyStyle::Color
+        }
+    }
+}
+
+/// Paint the stdout body into rows `top..limit`. In `Color` mode the command's ANSI colours are
+/// preserved; in `Diff` mode characters that differ from the previous output are shown in red;
+/// `Plain` prints raw characters. Lines beyond the region and columns beyond the window are
+/// dropped; unused rows in the region are erased.
 fn draw_body(
     out: &mut impl Write,
     content: &str,
     prev: Option<&str>,
-    differences: bool,
+    style: BodyStyle,
     cols: u16,
     top: u16,
     limit: u16,
@@ -410,19 +530,25 @@ fn draw_body(
         }
         out.queue(cursor::MoveTo(0, row))?;
         out.queue(Clear(ClearType::UntilNewLine))?;
-        let mut prev_chars = prev_lines.get(li).copied().unwrap_or("").chars();
-        for (col, ch) in line.chars().enumerate() {
-            if col as u16 >= cols {
-                break;
-            }
-            // `prev_chars` walks in lockstep with `line`; short-circuiting when -d is off just
-            // means we never consume it.
-            if differences && prev_chars.next() != Some(ch) {
-                out.queue(SetForegroundColor(Color::Red))?;
-                out.queue(Print(ch))?;
-                out.queue(ResetColor)?;
-            } else {
-                out.queue(Print(ch))?;
+        if let BodyStyle::Color = style {
+            // Colour path: escape sequences pass through with zero width (default / -c).
+            draw_line_ansi(out, line, cols as usize)?;
+        } else {
+            let differences = matches!(style, BodyStyle::Diff);
+            let mut prev_chars = prev_lines.get(li).copied().unwrap_or("").chars();
+            for (col, ch) in line.chars().enumerate() {
+                if col as u16 >= cols {
+                    break;
+                }
+                // `prev_chars` walks in lockstep with `line`; short-circuiting when -d is off just
+                // means we never consume it.
+                if differences && prev_chars.next() != Some(ch) {
+                    out.queue(SetForegroundColor(Color::Red))?;
+                    out.queue(Print(ch))?;
+                    out.queue(ResetColor)?;
+                } else {
+                    out.queue(Print(ch))?;
+                }
             }
         }
         row += 1;
@@ -502,7 +628,7 @@ fn draw_frame(
         top = 2;
     }
     if top < body_limit {
-        draw_body(out, content, prev, args.differences, cols, top, body_limit)?;
+        draw_body(out, content, prev, BodyStyle::from_args(args), cols, top, body_limit)?;
     }
     if let Some(height) = pane {
         draw_stderr(out, &err_lines, cols, rows, height)?;
@@ -518,18 +644,24 @@ fn draw_follow(
     content: &str,
     stderr: &str,
     prev: Option<&str>,
-    differences: bool,
+    style: BodyStyle,
 ) -> std::io::Result<()> {
     let prev_lines: Vec<&str> = prev.map(|p| p.lines().collect()).unwrap_or_default();
     for (li, line) in content.lines().enumerate() {
-        let mut prev_chars = prev_lines.get(li).copied().unwrap_or("").chars();
-        for ch in line.chars() {
-            if differences && prev_chars.next() != Some(ch) {
-                out.queue(SetForegroundColor(Color::Red))?;
-                out.queue(Print(ch))?;
-                out.queue(ResetColor)?;
-            } else {
-                out.queue(Print(ch))?;
+        if let BodyStyle::Color = style {
+            // Colour path: keep the command's ANSI sequences intact (no width clip in follow mode).
+            draw_line_ansi(out, line, usize::MAX)?;
+        } else {
+            let differences = matches!(style, BodyStyle::Diff);
+            let mut prev_chars = prev_lines.get(li).copied().unwrap_or("").chars();
+            for ch in line.chars() {
+                if differences && prev_chars.next() != Some(ch) {
+                    out.queue(SetForegroundColor(Color::Red))?;
+                    out.queue(Print(ch))?;
+                    out.queue(ResetColor)?;
+                } else {
+                    out.queue(Print(ch))?;
+                }
             }
         }
         out.queue(Print("\r\n"))?;
@@ -556,9 +688,12 @@ fn main() {
     }
     let interval = args.interval.max(0.1);
     // Accepted for CLI parity: -s/--shotsdir is a no-op, and -w/--no-wrap is implicit because
-    // draw_row clips every line to the window width. -c/-C likewise: ANSI sequences in the
-    // command's output reach the terminal either way.
-    let _ = (&args.shotsdir, &args.no_wrap, &args.color, &args.no_color);
+    // draw_row clips every line to the window width. Colour: the body keeps the command's ANSI
+    // sequences by default (equivalent to -c); -C/--no-color turns that off, and -d/--differences
+    // takes precedence with its own red diff highlighting. -c is accepted as the explicit opt-in.
+    let _ = (&args.shotsdir, &args.no_wrap, &args.color);
+    // Colour the body unless -d asked for diff highlighting or -C disabled it.
+    let style = BodyStyle::from_args(&args);
     // Buffer the frame: `Stdout` is line-buffered, which would flush a syscall per row and make
     // the repaint visibly tear.
     let mut out = BufWriter::new(stdout());
@@ -583,14 +718,7 @@ fn main() {
         let (content, stderr, ok) = run_command(&args.command, &shell);
 
         if args.follow {
-            draw_follow(
-                &mut out,
-                &content,
-                &stderr,
-                prev.as_deref(),
-                args.differences,
-            )
-            .ok();
+            draw_follow(&mut out, &content, &stderr, prev.as_deref(), style).ok();
         } else {
             draw_frame(
                 &mut out,
@@ -656,4 +784,70 @@ fn main() {
     out.flush().ok();
     raw.release();
     screen.release();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collect the visible characters and preserved escape sequences from a parse.
+    fn split(line: &str) -> (String, Vec<String>) {
+        let mut visible = String::new();
+        let mut escapes = Vec::new();
+        for seg in parse_segments(line) {
+            match seg {
+                Seg::Char(c) => visible.push(c),
+                Seg::Escape(s) => escapes.push(s),
+            }
+        }
+        (visible, escapes)
+    }
+
+    #[test]
+    fn plain_text_has_no_escapes() {
+        let (visible, escapes) = split("hello world");
+        assert_eq!(visible, "hello world");
+        assert!(escapes.is_empty());
+    }
+
+    #[test]
+    fn sgr_colour_is_zero_width_and_preserved() {
+        let (visible, escapes) = split("a\x1b[31mred\x1b[0mb");
+        assert_eq!(visible, "aredb"); // 5 visible columns, colour codes don't count
+        assert_eq!(escapes, vec!["\x1b[31m".to_string(), "\x1b[0m".to_string()]);
+    }
+
+    #[test]
+    fn osc_sequence_terminated_by_bel() {
+        let (visible, escapes) = split("\x1b]0;title\x07x");
+        assert_eq!(visible, "x");
+        assert_eq!(escapes, vec!["\x1b]0;title\x07".to_string()]);
+    }
+
+    #[test]
+    fn osc_sequence_terminated_by_st() {
+        let (visible, escapes) = split("\x1b]0;t\x1b\\y");
+        assert_eq!(visible, "y");
+        assert_eq!(escapes, vec!["\x1b]0;t\x1b\\".to_string()]);
+    }
+
+    #[test]
+    fn two_byte_escape() {
+        let (visible, escapes) = split("\x1bcz");
+        assert_eq!(visible, "z");
+        assert_eq!(escapes, vec!["\x1bc".to_string()]);
+    }
+
+    /// The colour renderer clips on visible columns, not raw bytes: a colour code before the
+    /// budget is exhausted must not shorten how much text survives.
+    #[test]
+    fn ansi_render_clips_on_visible_columns() {
+        let mut buf: Vec<u8> = Vec::new();
+        draw_line_ansi(&mut buf, "\x1b[31mABCDE\x1b[0m", 3).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Colour code passes through; exactly 3 visible chars printed; ends with a reset.
+        assert!(s.contains("\x1b[31m"));
+        assert!(s.contains("ABC"));
+        assert!(!s.contains("ABCD"));
+    }
 }
