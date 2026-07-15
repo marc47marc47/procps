@@ -1,24 +1,39 @@
 //! [PLATFORM:WINDOWS] Process enumeration and operations — replaces /proc/[pid]/* and kill(2).
 //!
 //! How data is obtained:
-//! - Basic listing and ppid: CreateToolhelp32Snapshot / Process32NextW
-//! - CPU time, memory: OpenProcess + GetProcessTimes + K32GetProcessMemoryInfo
+//! - Listing, ppid, thread count, RSS/VSZ, cumulative CPU time: NtQuerySystemInformation
+//!   (SystemProcessInformation). This is a single system-wide snapshot that requires no
+//!   per-process handle, so it covers every process on the machine (including SYSTEM-owned
+//!   services, "Registry", "Secure System", "Memory Compression", ...) even without admin
+//!   rights — unlike CreateToolhelp32Snapshot + OpenProcess, which silently leaves RSS/CPU
+//!   zeroed for any process the caller can't open. CreateToolhelp32Snapshot is kept only as
+//!   a fallback if the NT call ever fails.
 //! - Command line / working directory: NtQueryInformationProcess to get the PEB address, then ReadProcessMemory
 //!   to read out RTL_USER_PROCESS_PARAMETERS level by level (CommandLine / CurrentDirectory)
 //! - Owner: OpenProcessToken + GetTokenInformation(TokenUser) + LookupAccountSidW
 //! - Memory regions (pmap): VirtualQueryEx + K32GetMappedFileNameW
+//! - At startup we best-effort enable SeDebugPrivilege (no-op / silently fails unless running
+//!   elevated) so that, when possible, OpenProcess can also reach protected/SYSTEM processes
+//!   for owner/exe/cmdline — the same trick Task Manager/Process Explorer use.
 
 use std::ffi::c_void;
 use std::io;
 use std::mem;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Once;
+use std::time::{Duration, SystemTime};
 
+use windows_sys::Wdk::System::SystemInformation::{
+    NtQuerySystemInformation, SystemProcessInformation,
+};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, LUID, STATUS_INFO_LENGTH_MISMATCH,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    AdjustTokenPrivileges, GetTokenInformation, LookupAccountSidW, LookupPrivilegeValueW,
+    SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -32,10 +47,11 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetMappedFileNameW, K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
+    GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken, PROCESS_QUERY_INFORMATION,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ, TerminateProcess,
     WaitForSingleObject,
 };
+use windows_sys::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
 
 use super::{filetime_to_ms, filetime_to_systemtime, wide_to_string};
 use crate::platform::types::{MemRegion, ProcessInfo, Signal};
@@ -57,8 +73,145 @@ fn open(pid: u32, access: u32) -> Option<Handle> {
     if h.is_null() { None } else { Some(Handle(h)) }
 }
 
-/// Toolhelp snapshot listing all processes (name / pid / ppid / threads).
-fn snapshot() -> io::Result<Vec<(u32, u32, String, u32)>> {
+/// Best-effort: enable SeDebugPrivilege in our own token so OpenProcess can reach
+/// protected/SYSTEM-owned processes too (mirrors what Task Manager/Process Explorer do
+/// when "Run as administrator"). Silently does nothing when not elevated — our token
+/// simply won't have the privilege to enable, and AdjustTokenPrivileges reports that
+/// via GetLastError rather than a hard failure we need to react to.
+fn enable_debug_privilege() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: all out-parameters are properly sized and initialized before use
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &mut token) == 0 {
+                return;
+            }
+            let token = Handle(token);
+            let mut luid: LUID = mem::zeroed();
+            if LookupPrivilegeValueW(std::ptr::null(), SE_DEBUG_NAME, &mut luid) == 0 {
+                return;
+            }
+            let mut priv_: TOKEN_PRIVILEGES = mem::zeroed();
+            priv_.PrivilegeCount = 1;
+            priv_.Privileges[0].Luid = luid;
+            priv_.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(token.0, 0, &priv_, 0, std::ptr::null_mut(), std::ptr::null_mut());
+        }
+    });
+}
+
+/// A single process entry read from the system-wide NT snapshot (or, as fallback, Toolhelp).
+struct RawProc {
+    pid: u32,
+    ppid: u32,
+    name: String,
+    threads: u32,
+    rss_bytes: u64,
+    vsz_bytes: u64,
+    utime_ms: u64,
+    stime_ms: u64,
+    start_time: Option<SystemTime>,
+}
+
+/// Convert a raw 100ns-tick count (as found in SYSTEM_PROCESS_INFORMATION) into a FILETIME
+/// so it can go through the existing filetime_to_ms / filetime_to_systemtime helpers.
+fn raw_100ns_to_filetime(t: i64) -> FILETIME {
+    let t = t as u64;
+    FILETIME { dwLowDateTime: (t & 0xFFFF_FFFF) as u32, dwHighDateTime: (t >> 32) as u32 }
+}
+
+/// Read a UNICODE_STRING that points into our own `NtQuerySystemInformation` buffer.
+fn image_name(name: &windows_sys::Win32::Foundation::UNICODE_STRING, pid: u32) -> String {
+    if name.Buffer.is_null() {
+        return match pid {
+            0 => "System Idle Process".to_string(),
+            4 => "System".to_string(),
+            _ => format!("[pid {pid}]"),
+        };
+    }
+    // SAFETY: Buffer/Length come from a kernel-filled UNICODE_STRING inside a buffer we own
+    unsafe {
+        let slice = std::slice::from_raw_parts(name.Buffer, name.Length as usize / 2);
+        String::from_utf16_lossy(slice)
+    }
+}
+
+/// System-wide process snapshot via NtQuerySystemInformation(SystemProcessInformation).
+///
+/// Unlike CreateToolhelp32Snapshot, this single call also returns each process's thread
+/// count, working-set size, commit charge, and cumulative kernel/user CPU time directly —
+/// no per-process OpenProcess needed, so SYSTEM-owned/protected processes are fully
+/// populated even when we can't open a handle to them.
+fn snapshot_nt() -> io::Result<Vec<RawProc>> {
+    let mut buffer_size: usize = 512 * 1024;
+    loop {
+        let mut buf: Vec<u8> = vec![0u8; buffer_size];
+        let mut needed: u32 = 0;
+        // SAFETY: buf is sized `buffer_size` bytes and that size is passed through
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buf.as_mut_ptr() as *mut c_void,
+                buffer_size as u32,
+                &mut needed,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            buffer_size = if needed == 0 { buffer_size * 2 } else { needed as usize + 64 * 1024 };
+            continue;
+        }
+        if status < 0 {
+            return Err(io::Error::other(format!(
+                "NtQuerySystemInformation(SystemProcessInformation) failed: {status:#x}"
+            )));
+        }
+
+        let mut out = Vec::new();
+        let mut offset: isize = 0;
+        loop {
+            // SAFETY: offset stays within `buf`, which is large enough per the successful
+            // call above; NextEntryOffset is kernel-provided and walks entry by entry
+            unsafe {
+                let p = buf.as_ptr().offset(offset) as *const SYSTEM_PROCESS_INFORMATION;
+                let pi = &*p;
+
+                let pid = pi.UniqueProcessId as usize as u32;
+                // `Reserved2` is InheritedFromUniqueProcessId (a HANDLE-sized PPID) —
+                // windows-sys folds this undocumented-ish field into a reserved slot.
+                let ppid = pi.Reserved2 as usize as u32;
+                // `Reserved1` packs WorkingSetPrivateSize(8) + HardFaultCount(4) +
+                // NumberOfThreadsHighWatermark(4) + CycleTime(8) + CreateTime(8) +
+                // UserTime(8) + KernelTime(8) = 48 bytes, in that order.
+                let create_time = i64::from_ne_bytes(pi.Reserved1[24..32].try_into().unwrap());
+                let user_time = i64::from_ne_bytes(pi.Reserved1[32..40].try_into().unwrap());
+                let kernel_time = i64::from_ne_bytes(pi.Reserved1[40..48].try_into().unwrap());
+
+                out.push(RawProc {
+                    pid,
+                    ppid,
+                    name: image_name(&pi.ImageName, pid),
+                    threads: pi.NumberOfThreads,
+                    rss_bytes: pi.WorkingSetSize as u64,
+                    vsz_bytes: pi.PagefileUsage as u64,
+                    utime_ms: filetime_to_ms(raw_100ns_to_filetime(user_time)),
+                    stime_ms: filetime_to_ms(raw_100ns_to_filetime(kernel_time)),
+                    start_time: filetime_to_systemtime(raw_100ns_to_filetime(create_time)),
+                });
+
+                if pi.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += pi.NextEntryOffset as isize;
+            }
+        }
+        return Ok(out);
+    }
+}
+
+/// Toolhelp snapshot listing all processes (name / pid / ppid / threads) — fallback used
+/// only if the NT-based snapshot above ever fails.
+fn snapshot_toolhelp() -> io::Result<Vec<RawProc>> {
     // SAFETY: the snapshot handle is checked, then closed after the loop
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -71,12 +224,17 @@ fn snapshot() -> io::Result<Vec<(u32, u32, String, u32)>> {
         let mut out = Vec::new();
         if Process32FirstW(snap.0, &mut entry) != 0 {
             loop {
-                out.push((
-                    entry.th32ProcessID,
-                    entry.th32ParentProcessID,
-                    wide_to_string(&entry.szExeFile),
-                    entry.cntThreads,
-                ));
+                out.push(RawProc {
+                    pid: entry.th32ProcessID,
+                    ppid: entry.th32ParentProcessID,
+                    name: wide_to_string(&entry.szExeFile),
+                    threads: entry.cntThreads,
+                    rss_bytes: 0,
+                    vsz_bytes: 0,
+                    utime_ms: 0,
+                    stime_ms: 0,
+                    start_time: None,
+                });
                 if Process32NextW(snap.0, &mut entry) == 0 {
                     break;
                 }
@@ -84,6 +242,12 @@ fn snapshot() -> io::Result<Vec<(u32, u32, String, u32)>> {
         }
         Ok(out)
     }
+}
+
+/// All processes on the system, preferring the complete NT-based snapshot and falling back
+/// to Toolhelp32 only if that call is ever unavailable (e.g. blocked by policy).
+fn snapshot() -> io::Result<Vec<RawProc>> {
+    snapshot_nt().or_else(|_| snapshot_toolhelp())
 }
 
 fn process_times(h: HANDLE) -> Option<(u64, u64, Option<std::time::SystemTime>)> {
@@ -104,16 +268,16 @@ fn process_times(h: HANDLE) -> Option<(u64, u64, Option<std::time::SystemTime>)>
     }
 }
 
-fn process_memory(h: HANDLE) -> (u64, u64) {
+fn process_memory(h: HANDLE) -> Option<(u64, u64)> {
     // SAFETY: PROCESS_MEMORY_COUNTERS is output-only
     unsafe {
         let mut pmc: PROCESS_MEMORY_COUNTERS = mem::zeroed();
         if K32GetProcessMemoryInfo(h, &mut pmc, mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32) != 0
         {
             // WorkingSetSize ≈ RSS; PagefileUsage ≈ commit charge (used as a VSZ approximation)
-            (pmc.WorkingSetSize as u64, pmc.PagefileUsage as u64)
+            Some((pmc.WorkingSetSize as u64, pmc.PagefileUsage as u64))
         } else {
-            (0, 0)
+            None
         }
     }
 }
@@ -237,7 +401,11 @@ unsafe fn read_wstr(h: HANDLE, addr: *const c_void, byte_len: usize) -> Option<S
         )
     };
     if ok != 0 {
-        Some(String::from_utf16_lossy(&buf[..read / 2]))
+        // Some processes report a CommandLine/CurrentDirectory Length that includes the
+        // NUL terminator (or padding); a literal embedded '\0' would otherwise reach
+        // stdout as a raw NUL byte and make tools like `grep` treat the whole stream as
+        // binary. A real Windows command line never legitimately contains one.
+        Some(String::from_utf16_lossy(&buf[..read / 2]).replace('\0', ""))
     } else {
         None
     }
@@ -312,34 +480,54 @@ fn split_cmdline(s: &str) -> Vec<String> {
     args
 }
 
-fn build_info(pid: u32, ppid: u32, name: String, threads: u32) -> ProcessInfo {
+fn build_info(raw: RawProc) -> ProcessInfo {
     let mut info = ProcessInfo {
-        pid,
-        ppid,
-        name,
-        threads,
+        pid: raw.pid,
+        ppid: raw.ppid,
+        name: raw.name,
+        threads: raw.threads,
+        rss_bytes: raw.rss_bytes,
+        vsz_bytes: raw.vsz_bytes,
+        utime_ms: raw.utime_ms,
+        stime_ms: raw.stime_ms,
+        start_time: raw.start_time,
         state: '?', // [PORT:WINDOWS] Windows has no R/S/D/Z process state; only individual threads do
         ..Default::default()
     };
 
-    // first try full access (reading the PEB needs VM_READ + QUERY_INFORMATION), then fall back on failure
-    if let Some(h) = open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ) {
+    // Owner/exe/cmdline still need a live handle, which SYSTEM/protected processes may
+    // deny even after enable_debug_privilege(); rss/vsz/times above already came from the
+    // system-wide NT snapshot, so a denied handle here no longer means "no data at all".
+    // First try full access (reading the PEB needs VM_READ + QUERY_INFORMATION), then fall back on failure.
+    if let Some(h) = open(info.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ) {
         fill_from_handle(&mut info, h.0, true);
-    } else if let Some(h) = open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+    } else if let Some(h) = open(info.pid, PROCESS_QUERY_LIMITED_INFORMATION) {
         fill_from_handle(&mut info, h.0, false);
+    }
+    if info.cmdline.is_empty() {
+        // fall back to using the image name as argv[0]
+        info.cmdline = vec![
+            info.exe
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| info.name.clone()),
+        ];
     }
     info
 }
 
 fn fill_from_handle(info: &mut ProcessInfo, h: HANDLE, can_read_mem: bool) {
+    // Prefer the fresher per-handle reading when available; otherwise keep the values
+    // already populated from the NT snapshot in build_info().
     if let Some((u, s, start)) = process_times(h) {
         info.utime_ms = u;
         info.stime_ms = s;
         info.start_time = start;
     }
-    let (rss, vsz) = process_memory(h);
-    info.rss_bytes = rss;
-    info.vsz_bytes = vsz;
+    if let Some((rss, vsz)) = process_memory(h) {
+        info.rss_bytes = rss;
+        info.vsz_bytes = vsz;
+    }
     if let Some(owner) = process_owner(h) {
         info.user = owner;
     }
@@ -352,15 +540,6 @@ fn fill_from_handle(info: &mut ProcessInfo, h: HANDLE, can_read_mem: bool) {
         if let Some(cl) = cmdline {
             info.cmdline = split_cmdline(&cl);
         }
-    }
-    if info.cmdline.is_empty() {
-        // fall back to using the image name as argv[0]
-        info.cmdline = vec![
-            info.exe
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| info.name.clone()),
-        ];
     }
 }
 
@@ -379,18 +558,17 @@ fn full_image_path(h: HANDLE) -> Option<String> {
 }
 
 pub fn list_processes() -> io::Result<Vec<ProcessInfo>> {
+    enable_debug_privilege();
     let snap = snapshot()?;
-    Ok(snap
-        .into_iter()
-        .map(|(pid, ppid, name, threads)| build_info(pid, ppid, name, threads))
-        .collect())
+    Ok(snap.into_iter().map(build_info).collect())
 }
 
 pub fn process_info(pid: u32) -> io::Result<ProcessInfo> {
+    enable_debug_privilege();
     let snap = snapshot()?;
     snap.into_iter()
-        .find(|(p, ..)| *p == pid)
-        .map(|(pid, ppid, name, threads)| build_info(pid, ppid, name, threads))
+        .find(|p| p.pid == pid)
+        .map(build_info)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no such pid: {pid}")))
 }
 
